@@ -9,11 +9,12 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@500;600;700;800&display=swap" rel="stylesheet">
 <style>
-/* Sends photos to a Frame Home TV through ntfy.sh. The TV shows a QR code with a link to this
-   page; the part after # is a secret mailbox name the TV is watching. Each photo goes as it
-   is, full size and quality. The one exception is HEIC, which the TV can't show: it becomes a
-   full-resolution JPEG at top quality. ntfy.sh takes up to 15 MB a photo and deletes it after
-   3 hours. */
+/* Sends photos to a Frame Home TV through its owner's own photo relay (a small Cloudflare
+   Worker; see relay/ in the Frame Home repo). The TV shows a QR code with a link to this page;
+   after # it carries the secret mailbox code (t) and the relay's address (r), and never
+   reaches GitHub. Each photo goes as it is, full size and quality. The one exception is HEIC,
+   which the TV can't show: it becomes a full-resolution JPEG at top quality. The relay keeps a
+   photo only until the TV has saved it. */
 :root {
     --bg: #0b0e18;
     --ink: #ffffff;
@@ -60,21 +61,26 @@ h1 { margin: 8px 0 6px; font-size: 30px; line-height: 36px; font-weight: 800; le
         <ul class="list" id="list"></ul>
     </div>
 
-    <p class="note">Photos go at full size and quality, up to 15 MB each, through ntfy.sh, a free relay that deletes them within 3 hours. Only your TV, showing this page's code, receives them.</p>
+    <p class="note">Photos go at full size and quality to your own Frame Home relay, which keeps each one only until your TV has saved it. Only the TV showing this page's code receives them.</p>
 </main>
 
 <script>
 (function () {
     'use strict';
-    const RELAY = 'https://ntfy.sh/';
-    const MAX_BYTES = 15 * 1024 * 1024; // ntfy.sh's limit for one file
-    const topic = decodeURIComponent(location.hash.slice(1));
+    const MAX_BYTES = 95 * 1024 * 1024; // the relay's limit for one photo
+    const args = {};
+    location.hash.slice(1).split('&').forEach(function (kv) {
+        const i = kv.indexOf('=');
+        if (i > 0) args[kv.slice(0, i)] = decodeURIComponent(kv.slice(i + 1));
+    });
+    const code = args.t || '';
+    const relay = String(args.r || '').replace(/\/+$/, '');
     const $ = function (id) { return document.getElementById(id); };
     const items = [];
     let sending = false;
 
-    if (!/^fh-[A-Za-z0-9]{16,61}$/.test(topic)) {
-        $('lead').textContent = 'Open this page from your TV: on Frame Home, go to Settings › Art › Add your images › From your phone, and scan the code with your camera.';
+    if (!/^fh-[A-Za-z0-9]{16,61}$/.test(code) || !/^(https:\/\/[\w.-]+|http:\/\/localhost(:\d+)?)(\/[\w.\/-]*)?$/.test(relay)) {
+        $('lead').textContent = 'Open this page from your TV: on Frame Home, go to Settings › Art › Add your images › From your phone, and scan the code with your camera. (A code scanned before the relay was set up won’t work; scan a new one.)';
         $('ready').classList.add('hidden');
         return;
     }
@@ -150,16 +156,19 @@ h1 { margin: 8px 0 6px; font-size: 30px; line-height: 36px; font-weight: 800; le
         return asJpeg(file).then(function (b) { return { blob: b, name: (file.name || 'photo').replace(/\.[^.]*$/, '') + '.jpg' }; });
     }
 
+    let expired = false;
+
     function send(it, n) {
         setItem(it, 'busy', 'Sending…');
         return prepare(it.file).then(function (p) {
-            if (p.blob.size > MAX_BYTES) throw new Error('Over 15 MB');
-            const name = n + '-' + p.name.replace(/[^\w.-]/g, '_');
-            return fetch(RELAY + encodeURIComponent(topic) + '?filename=' + encodeURIComponent(name), { method: 'PUT', body: p.blob });
+            if (p.blob.size > MAX_BYTES) throw new Error('Over 95 MB');
+            const name = Date.now().toString(36) + '-' + n + '-' + p.name.replace(/[^\w.-]/g, '_').slice(-120);
+            return fetch(relay + '/box/' + code + '/' + encodeURIComponent(name), { method: 'PUT', headers: { 'Content-Type': p.blob.type || 'image/jpeg' }, body: p.blob });
         }).then(function (r) {
-            if (!r.ok) throw new Error(r.status === 429 ? 'Too many at once' : r.status === 413 ? 'Too large' : 'Failed (' + r.status + ')');
+            if (r.status === 410) { expired = true; throw new Error('Code expired'); }
+            if (!r.ok) throw new Error(r.status === 413 ? 'Too large' : 'Failed (' + r.status + ')');
             setItem(it, 'sent', 'Sent');
-        }, function (e) {
+        }).catch(function (e) {
             setItem(it, 'failed', e.message || 'Failed');
             throw e;
         });
@@ -172,17 +181,18 @@ h1 { margin: 8px 0 6px; font-size: 30px; line-height: 36px; font-weight: 800; le
         paintButton();
         setStatus('Sending ' + todo.length + (todo.length === 1 ? ' photo…' : ' photos…'));
         let failed = 0;
-        // One at a time, a moment apart, to stay inside ntfy.sh's limits.
+        // One at a time, so a slow connection isn't swamped.
         todo.reduce(function (p, it, i) {
             return p.then(function () {
                 return send(it, i).catch(function () { failed++; }).then(function () {
-                    return new Promise(function (r) { setTimeout(r, 400); });
+                    return null;
                 });
             });
         }, Promise.resolve()).then(function () {
             sending = false;
             paintButton();
-            if (failed) setStatus(failed + ' didn’t send. Photos over 15 MB are too large for the relay; others, tap Send to try again.', 'bad');
+            if (expired) setStatus('This code has expired. On the TV, open From your phone again and scan the new code.', 'bad');
+            else if (failed) setStatus(failed + ' didn’t send. Check your connection and tap Send to try again.', 'bad');
             else setStatus('Sent. They’re on your TV now. Choose more, or you’re done.', 'ok');
         });
     });
