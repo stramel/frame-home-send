@@ -10,8 +10,10 @@
 <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@500;600;700;800&display=swap" rel="stylesheet">
 <style>
 /* Sends photos to a Frame Home TV through ntfy.sh. The TV shows a QR code with a link to this
-   page; the part after # is a secret mailbox name the TV is watching. Each photo is shrunk to
-   TV size here on the phone, then sent to that mailbox. ntfy.sh deletes it after 3 hours. */
+   page; the part after # is a secret mailbox name the TV is watching. Each photo goes as it
+   is, full size and quality. The one exception is HEIC, which the TV can't show: it becomes a
+   full-resolution JPEG at top quality. ntfy.sh takes up to 15 MB a photo and deletes it after
+   3 hours. */
 :root {
     --bg: #0b0e18;
     --ink: #ffffff;
@@ -58,14 +60,14 @@ h1 { margin: 8px 0 6px; font-size: 30px; line-height: 36px; font-weight: 800; le
         <ul class="list" id="list"></ul>
     </div>
 
-    <p class="note">Photos are shrunk to TV size on your phone, then pass through ntfy.sh, a free relay, which deletes them within 3 hours. Only your TV, showing this page's code, receives them.</p>
+    <p class="note">Photos go at full size and quality, up to 15 MB each, through ntfy.sh, a free relay that deletes them within 3 hours. Only your TV, showing this page's code, receives them.</p>
 </main>
 
 <script>
 (function () {
     'use strict';
     const RELAY = 'https://ntfy.sh/';
-    const MAX_EDGE = 3840; // the Frame's 4K panel
+    const MAX_BYTES = 15 * 1024 * 1024; // ntfy.sh's limit for one file
     const topic = decodeURIComponent(location.hash.slice(1));
     const $ = function (id) { return document.getElementById(id); };
     const items = [];
@@ -115,29 +117,45 @@ h1 { margin: 8px 0 6px; font-size: 30px; line-height: 36px; font-weight: 800; le
         paintButton();
     });
 
-    // Draw the photo no larger than the TV needs and save it as JPEG.
-    function shrink(file) {
+    function isHeic(file) {
+        return /^image\/hei[cf]/i.test(file.type) || /\.hei[cf]$/i.test(file.name);
+    }
+
+    // HEIC only: the TV can't show it, so redraw it as a JPEG at its full size and top quality.
+    function asJpeg(file) {
         return new Promise(function (resolve, reject) {
             const img = new Image();
             const url = URL.createObjectURL(file);
             img.onload = function () {
-                const scale = Math.min(1, MAX_EDGE / Math.max(img.naturalWidth, img.naturalHeight));
                 const c = document.createElement('canvas');
-                c.width = Math.round(img.naturalWidth * scale);
-                c.height = Math.round(img.naturalHeight * scale);
-                c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+                c.width = img.naturalWidth;
+                c.height = img.naturalHeight;
+                c.getContext('2d').drawImage(img, 0, 0);
                 URL.revokeObjectURL(url);
-                c.toBlob(function (b) { b ? resolve(b) : reject(new Error('Couldn’t read this photo')); }, 'image/jpeg', 0.88);
+                c.toBlob(function (b) { b ? resolve(b) : reject(new Error('Couldn’t read this photo')); }, 'image/jpeg', 1);
             };
             img.onerror = function () { URL.revokeObjectURL(url); reject(new Error('Couldn’t read this photo')); };
             img.src = url;
         });
     }
 
+    // The photo as it is, unless it's HEIC. Read into memory first: sending the picked file
+    // straight from the photo library fails in some browsers. Same bytes either way.
+    function prepare(file) {
+        if (!isHeic(file)) {
+            return file.arrayBuffer().then(function (buf) {
+                return { blob: new Blob([buf], { type: file.type || 'image/jpeg' }), name: file.name || 'photo.jpg' };
+            });
+        }
+        return asJpeg(file).then(function (b) { return { blob: b, name: (file.name || 'photo').replace(/\.[^.]*$/, '') + '.jpg' }; });
+    }
+
     function send(it, n) {
         setItem(it, 'busy', 'Sending…');
-        return shrink(it.file).then(function (blob) {
-            return fetch(RELAY + encodeURIComponent(topic) + '?filename=photo-' + Date.now() + '-' + n + '.jpg', { method: 'PUT', body: blob });
+        return prepare(it.file).then(function (p) {
+            if (p.blob.size > MAX_BYTES) throw new Error('Over 15 MB');
+            const name = n + '-' + p.name.replace(/[^\w.-]/g, '_');
+            return fetch(RELAY + encodeURIComponent(topic) + '?filename=' + encodeURIComponent(name), { method: 'PUT', body: p.blob });
         }).then(function (r) {
             if (!r.ok) throw new Error(r.status === 429 ? 'Too many at once' : r.status === 413 ? 'Too large' : 'Failed (' + r.status + ')');
             setItem(it, 'sent', 'Sent');
@@ -164,7 +182,7 @@ h1 { margin: 8px 0 6px; font-size: 30px; line-height: 36px; font-weight: 800; le
         }, Promise.resolve()).then(function () {
             sending = false;
             paintButton();
-            if (failed) setStatus(failed + ' didn’t send. Tap Send to try again.', 'bad');
+            if (failed) setStatus(failed + ' didn’t send. Photos over 15 MB are too large for the relay; others, tap Send to try again.', 'bad');
             else setStatus('Sent. They’re on your TV now. Choose more, or you’re done.', 'ok');
         });
     });
